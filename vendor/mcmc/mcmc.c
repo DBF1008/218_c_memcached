@@ -26,9 +26,11 @@
 
 #define FLAG_BUF_WANTED_READ 0x4
 
-#define STATE_DEFAULT 0 // looking for any kind of response
-#define STATE_GET_RESP 1 // processing VALUE's until END
-#define STATE_STAT_RESP 2 // processing STAT's until END
+// STATE_DEFAULT, STATE_GET_RESP, STATE_STAT_RESP are now public in mcmc.h
+// as MCMC_STATE_DEFAULT, MCMC_STATE_GET_RESP, MCMC_STATE_STAT_RESP.
+#define STATE_DEFAULT    MCMC_STATE_DEFAULT
+#define STATE_GET_RESP   MCMC_STATE_GET_RESP
+#define STATE_STAT_RESP  MCMC_STATE_STAT_RESP
 #define STATE_STAT_RESP_DONE 3
 
 typedef struct mcmc_ctx {
@@ -41,6 +43,14 @@ typedef struct mcmc_ctx {
     // FIXME: s/buffer_used/buffer_filled/ ?
     size_t buffer_used; // amount of bytes read into the buffer so far.
     char *buffer_head; // buffer pointer currently in use.
+
+    // Multiget / stat state machine: tracks whether we are inside a
+    // multi-response sequence so the parser stays in the correct read mode
+    // until END is seen.
+    int parse_state;
+    // Bytes consumed (header + value) by the last parse call, so callers
+    // can advance their buffer via mcmc_buffer_consume().
+    size_t last_consumed;
 } mcmc_ctx_t;
 
 // INTERNAL FUNCTIONS
@@ -255,9 +265,9 @@ static int _mcmc_parse_stat_line(const char *buf, mcmc_resp_t *r) {
     return MCMC_CODE_OK;
 }
 
-// FIXME: This is broken for ASCII multiget.
-// if we get VALUE back, we need to stay in ASCII GET read mode until an END
-// is seen.
+// State tracking for ASCII multiget / stat sequences is handled by
+// mcmc_parse_response_buf() and the ctx->parse_state field.
+// _mcmc_parse_response() itself is the stateless line parser.
 static int _mcmc_parse_response(const char *buf, size_t read, mcmc_resp_t *r) {
     const char *cur = buf;
     int rlen; // response code length.
@@ -747,7 +757,7 @@ int mcmc_parse_buf(const char *buf, size_t read, mcmc_resp_t *r) {
     char *el;
 
     memset(r, 0, sizeof(*r));
-    el = memchr(buf, '\n', read);
+    el = (char *)memchr(buf, '\n', read);
     if (el == NULL) {
         r->code = MCMC_WANT_READ;
         return MCMC_ERR;
@@ -761,6 +771,68 @@ int mcmc_parse_buf(const char *buf, size_t read, mcmc_resp_t *r) {
     // have a \r. check for it and fail?
 
     return _mcmc_parse_response(buf, read, r);
+}
+
+// Stateful wrapper around mcmc_parse_buf(): tracks the multiget / stat
+// state machine so the parser stays in the correct read mode across
+// successive VALUE lines until END is seen.
+//
+// After a MCMC_RESP_GET response, ctx enters STATE_GET_RESP and stays there
+// until a MCMC_RESP_END response resets it to STATE_DEFAULT.
+// Likewise, MCMC_RESP_STAT enters STATE_STAT_RESP until END.
+//
+// On success, ctx->last_consumed is updated with the total number of bytes
+// consumed from the buffer (reslen + vlen_read), which the caller can
+// retrieve via mcmc_buffer_consume() to advance their buffer pointer.
+int mcmc_parse_response_buf(void *c, const char *buf, size_t read, mcmc_resp_t *r) {
+    mcmc_ctx_t *ctx = (mcmc_ctx_t *)c;
+    int status = mcmc_parse_buf(buf, read, r);
+
+    if (status == MCMC_OK) {
+        switch (r->type) {
+        case MCMC_RESP_GET:
+            ctx->parse_state = STATE_GET_RESP;
+            break;
+        case MCMC_RESP_STAT:
+            ctx->parse_state = STATE_STAT_RESP;
+            break;
+        case MCMC_RESP_END:
+            ctx->parse_state = STATE_DEFAULT;
+            break;
+        case MCMC_RESP_FAIL:
+            // parse failure: reset state to avoid getting stuck.
+            ctx->parse_state = STATE_DEFAULT;
+            break;
+        default:
+            // Any other response type (GENERIC, META, NUMERIC, VERSION,
+            // ERRMSG) does not change the current state — inside a
+            // multiget sequence those should not normally appear, but we
+            // leave the state unchanged so the caller can detect the
+            // anomaly while we still keep tracking END.
+            break;
+        }
+    }
+
+    // Record how many bytes the caller should advance past.
+    ctx->last_consumed = r->reslen + r->vlen_read;
+    return status;
+}
+
+// Returns the number of bytes consumed from the buffer by the most recent
+// mcmc_parse_buf() / mcmc_parse_response_buf() call.  The value equals
+// r->reslen + r->vlen_read: the response header line plus any value data
+// that was already present in the buffer.
+size_t mcmc_buffer_consume(void *c) {
+    mcmc_ctx_t *ctx = (mcmc_ctx_t *)c;
+    return ctx->last_consumed;
+}
+
+// Returns the current parser state (MCMC_STATE_DEFAULT, MCMC_STATE_GET_RESP,
+// or MCMC_STATE_STAT_RESP).  Useful for callers who manage their own
+// buffer loop and need to know whether more VALUE / STAT lines are expected.
+int mcmc_read_state(void *c) {
+    mcmc_ctx_t *ctx = (mcmc_ctx_t *)c;
+    return ctx->parse_state;
 }
 
 // Context-ful API.

@@ -65,6 +65,11 @@
 #define MCMC_TOKTO_ELONG -2
 #define MCMC_TOKTO_EINVALID -3
 
+// Parser state for multi-response sequences (multiget, stats).
+#define MCMC_STATE_DEFAULT 0       // looking for any kind of response
+#define MCMC_STATE_GET_RESP 1      // inside ASCII GET sequence, expecting VALUE or END
+#define MCMC_STATE_STAT_RESP 2     // inside STAT sequence, expecting STAT or END
+
 typedef struct mcmc_resp_s {
     short type;
     short code;
@@ -131,6 +136,19 @@ int mcmc_request_writev(void *c, const struct iovec *iov, int iovcnt, ssize_t *s
 //int mcmc_read_value(void *c, char *val, mcmc_resp_t *r, int *read);
 int mcmc_disconnect(void *c);
 void mcmc_get_error(void *c, char *code, size_t clen, char *msg, size_t mlen);
+
+// Stateful parse: wraps mcmc_parse_buf() and tracks multiget/stat state.
+// After a GET response (VALUE), ctx enters MCMC_STATE_GET_RESP and stays
+// there until END is seen.  Similarly for STAT sequences.
+int mcmc_parse_response_buf(void *c, const char *buf, size_t read, mcmc_resp_t *r);
+
+// Returns the number of bytes consumed by the last mcmc_parse_buf() or
+// mcmc_parse_response_buf() call (header line + any value bytes in buffer).
+// Caller uses this to advance the buffer pointer before the next parse call.
+size_t mcmc_buffer_consume(void *c);
+
+// Returns the current multiget/stat parser state (MCMC_STATE_*).
+int mcmc_read_state(void *c);
 
 // TODO: experimental interface. high chance of changing.
 // all meta results are of format "XX m e t a", so if we know it's a result we
