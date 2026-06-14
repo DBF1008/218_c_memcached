@@ -570,7 +570,12 @@ static mcp_backend_wrap_t *_mcplib_backend_checkcache(lua_State *L, mcp_backend_
                 && strncmp(be_orig->be->port, bel->port, MAX_PORTLEN) == 0
                 && be_orig->be->conncount == bel->conncount
                 && memcmp(&be_orig->be->tunables, &bel->tunables, sizeof(bel->tunables)) == 0
-                && memcmp(&be_orig->be->logging, &bel->logging, sizeof(bel->logging)) == 0) {
+                && be_orig->be->logging.deadline == bel->logging.deadline
+                && be_orig->be->logging.rate == bel->logging.rate
+                && be_orig->be->logging.all_errors == bel->logging.all_errors
+                && (be_orig->be->logging.detail == bel->logging.detail
+                    || (be_orig->be->logging.detail && bel->logging.detail
+                        && strcmp(be_orig->be->logging.detail, bel->logging.detail) == 0))) {
             // backend is the same, return it.
             return be_orig;
         } else {

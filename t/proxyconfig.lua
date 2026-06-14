@@ -68,6 +68,13 @@ function mcp_config_pools(old)
             test = mcp.pool({down})
         }
         return pools
+    elseif mode == "logdetail" then
+        local b1 = mcp.backend({ label = "b1log", host = "127.0.0.1", port = 11518,
+            log = { deadline = 100, rate = 1, errors = true, tag = "mytag" } })
+        local pools = {
+            test = mcp.pool({b1})
+        }
+        return pools
     end
 end
 

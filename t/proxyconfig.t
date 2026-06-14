@@ -448,6 +448,46 @@ is(<$watcher>, "OK\r\n", "watcher enabled");
     check_version($ps);
 }
 
+# Disconnect the existing sockets and reset for log detail test
+@mocksrvs = ();
+$watcher = $p_srv->new_sock;
+print $watcher "watch proxyevents\n";
+is(<$watcher>, "OK\r\n", "watcher enabled");
+
+{
+    note("Testing reload with log detail/tag does not rebuild backends");
+    my $log_port = 11518;
+    my $log_srv = mock_server($log_port);
+    ok(defined $log_srv, "mock server created for log detail test");
+
+    # First load: create backend with logging detail/tag.
+    write_modefile('return "logdetail"');
+    $p_srv->reload();
+    wait_reload($watcher);
+
+    my $ms = IO::Select->new();
+    $ms->add($log_srv);
+    my @readable = $ms->can_read(2);
+    is(scalar @readable, 1, "listener became readable for log detail backend");
+    my $log_be = accept_backend($readable[0]);
+
+    # Second load: identical config — backend must be reused, no new connection.
+    $p_srv->reload();
+    wait_reload($watcher);
+
+    @readable = $ms->can_read(0.5);
+    is(scalar @readable, 0,
+        "no new connection after reload with same log detail (backend reused)");
+
+    # Third load: still identical — confirm stability across multiple reloads.
+    $p_srv->reload();
+    wait_reload($watcher);
+
+    @readable = $ms->can_read(0.5);
+    is(scalar @readable, 0,
+        "no new connection after third reload with same log detail");
+}
+
 # TODO:
 # remove backends
 # do dead sockets close?
