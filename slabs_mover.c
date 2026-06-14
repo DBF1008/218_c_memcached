@@ -380,11 +380,22 @@ static void slab_rebalance_rescue(struct slab_rebal_thread *t, struct _locked_st
     t->new_it = NULL;
 }
 
-// TODO: in order to rescue active chunked items we need to first do more work
-// on chunked items:
+// Active (refcount > 2) items found mid-move are rescued by copying them into
+// fresh memory and swapping with do_item_replace(), so the source page can be
+// freed while clients keep using the relocated copy.
+//
+// Chunked items can't be relocated while active yet. To do so we'd first need
+// more work on chunked items:
 // - individual chunks need to be refcounted, with refcounts protected by item
-// lock. then they can be swapped out an released on refcount reduction
+// lock. then they can be swapped out and released on refcount reduction
 // - for chunked item headers I don't know how off-hand.
+// Until that exists we must NOT destroy a still-referenced chunked item:
+// deleting one here turned transiently busy large objects (e.g. a key being
+// read by a client during a manual page move or automove) into silent data
+// loss, and coupled delete semantics with memory reclaim for extstore/header
+// combinations. Instead we leave the item linked and valid, report it busy,
+// and let the page mover keep looping; once its references drain it is rescued
+// normally by slab_rebalance_rescue() (which handles chunked items).
 static int slab_rebalance_active_rescue(struct slab_rebal_thread *t, struct _locked_st *a) {
     int cls_size = t->rebal.cls_size;
     item *it = a->it;
@@ -406,19 +417,10 @@ static int slab_rebalance_active_rescue(struct slab_rebal_thread *t, struct _loc
         // old it is now unlinked. can't immediately rescue item.
         t->new_it = NULL;
         return 0;
-    } else {
-        // else if chunked, check if we've been busy-waiting too long and
-        // delete the item.
-        if (t->rebal.busy_loops > SLAB_MOVE_MAX_LOOPS) {
-            // TODO: add indicator for source of eviction
-            LOGGER_LOG(t->l, LOG_EVICTIONS, LOGGER_EVICTION, it);
-            STORAGE_delete(t->storage, it);
-            do_item_unlink(it, a->hv);
-            t->rebal.busy_deletes++;
-        }
     }
 
-    // failed to rescue busy item.
+    // Active chunked item: leave it linked and valid, mark busy, and try again
+    // on a later loop once references drain. Never delete it here.
     return 1;
 }
 

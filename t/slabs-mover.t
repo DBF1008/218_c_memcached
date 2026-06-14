@@ -25,7 +25,8 @@ my $sock = $server->sock;
     is(scalar <$sock>, "OK\r\n", "flushed items before reflock test");
     wait_for_stat("curr_items", 0);
     subtest 'reflocked items' => \&test_reflocked;
-    # test reflocked chunked items (ensure busy_deletes)
+    # Reflocked *chunked* items (active large objects during a page move) are
+    # covered by t/slabs-reassign-chunked-busy.t: they must NOT be deleted.
 }
 
 # If I still remembered perl I'd do that dynamic comparator thing
@@ -80,7 +81,8 @@ sub find_largest_clsid {
 
 # NOTE: Can't validate reflocked items in an integration test since we leak
 # the memory and cannot de-ref an unlinked item.
-# TODO: test reflocked chunked items as well
+# Reflocked chunked items are validated in t/slabs-reassign-chunked-busy.t,
+# where the held item stays linked (never deleted) and is fetched back intact.
 sub test_reflocked {
     my $size = 9000;
     my $bigdata = 'x' x $size;
