@@ -84,6 +84,44 @@ my $stats_after = mem_stats($sock);
 cmp_ok($stats_after->{time_since_server_cert_refresh}, '<',
     $stats->{time_since_server_cert_refresh}, 'Certs refreshed');
 
+# --- Regression: failed refresh must not corrupt the live SSL_CTX ---
+# Corrupt the key file so that the refresh will fail partway through
+# (certificate chain loads OK, but the private key is garbage).
+my $key_backup = $key . ".good";
+copy($key, $key_backup) or die "Key backup failed: $!";
+open(my $badfh, '>', $key) or die "Cannot truncate key: $!";
+print $badfh "this is not a valid PEM key\n";
+close $badfh;
+
+# Attempt refresh; expect an error response (not OK).
+print $sock "refresh_certs\r\n";
+my $refresh_resp = scalar <$sock>;
+isnt($refresh_resp, "OK\r\n", 'refresh_certs with bad key returns error');
+
+# New connections must still succeed and present the original certificate,
+# proving that the live SSL_CTX was not partially overwritten.
+my $survivor_sock = $server->new_sock;
+ok(defined $survivor_sock, 'New TLS connection succeeds after failed refresh');
+$cert_details = $survivor_sock->dump_peer_certificate();
+$cert_details =~ m/(OU=([^\/\n]*))/;
+is($1, $default_crt_ou, 'New connection still uses old cert after failed refresh');
+$survivor_sock->close();
+
+# Existing connection should also still work.
+print $sock "version\r\n";
+my $ver = scalar <$sock>;
+like($ver, qr/^VERSION/, 'Existing connection still works after failed refresh');
+
+# Restore the good key and refresh again; should succeed.
+copy($key_backup, $key) or die "Key restore failed: $!";
+print $sock "refresh_certs\r\n";
+is(scalar <$sock>, "OK\r\n", 'refresh_certs succeeds after restoring good key');
+
+# Verify new connections work with the (re-refreshed) default cert.
+$cert_details = $server->new_sock->dump_peer_certificate();
+$cert_details =~ m/(OU=([^\/\n]*))/;
+is($1, $default_crt_ou, 'New connection works after recovery refresh');
+
 done_testing();
 
 END {
@@ -91,4 +129,5 @@ END {
     unlink $cert if $cert;
     unlink $key if $key;
     unlink $new_cert_key if $new_cert_key;
+    unlink "$key.good" if $key;
 }
