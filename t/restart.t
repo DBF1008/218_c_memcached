@@ -12,13 +12,51 @@ use MemcachedTest;
 # /dev/shm.
 my $mem_path = "/tmp/mc_restart.$$";
 
-# read a invalid metadata file
+# A corrupt, truncated, or unknown-tag restart metadata file must NOT crash the
+# server. Instead memcached should drop the old cache and come up cold. These
+# cases previously called abort() during startup, so the server could not even
+# begin listening.
 {
     my $meta_path = "$mem_path.meta";
-    open(my $f, "> $meta_path") || die("Can't open a metadata file.");
-    eval {  new_memcached("-e $mem_path"); };
-    unlink($meta_path);
-    ok($@, "Died with an empty metadata file");
+    # description => raw bytes written to the .meta file before starting.
+    # "" exercises the "couldn't read a tag" path; the others exercise the
+    # "couldn't parse the header tag" path (garbage, value-before-tag, and an
+    # unknown/unregistered tag).
+    my @corruptions = (
+        ["empty/truncated metadata file", ""],
+        ["garbage header line",           "this is not valid metadata\n"],
+        ["value line before any tag",     "Kfoo bar\n"],
+        ["unknown metadata tag",          "Tno_such_handler\n"],
+    );
+
+    for my $case (@corruptions) {
+        my ($desc, $contents) = @$case;
+
+        open(my $f, "> $meta_path") || die("Can't open a metadata file.");
+        print $f $contents;
+        close($f);
+
+        my $csrv;
+        eval { $csrv = new_memcached("-e $mem_path"); };
+        ok(!$@, "clean start despite $desc")
+            or diag("server unexpectedly failed to start: $@");
+
+        SKIP: {
+            skip "server did not start for $desc", 2 unless $csrv;
+            my $csock = $csrv->sock;
+            # Cold cache: nothing from a previous run should be present...
+            mem_get_is($csock, 'foo', undef);
+            # ...and the server must be fully usable.
+            print $csock "set canary 0 0 5\r\nhello\r\n";
+            like(scalar <$csock>, qr/STORED/, "server is usable after $desc");
+            $csrv->stop;
+        }
+
+        # Remove the data file plus any metadata written on shutdown so the
+        # next case (and the rest of this test) starts from a known state.
+        unlink($meta_path);
+        unlink($mem_path);
+    }
 }
 
 my $server = new_memcached("-m 128 -e $mem_path -I 2m -o temporary_ttl=240");

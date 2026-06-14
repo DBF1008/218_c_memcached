@@ -95,21 +95,27 @@ static int restart_check(const char *file) {
     ctx.cb = NULL;
     ctx.line = NULL;
     ctx.done = false;
+    // A corrupt, truncated, or otherwise unreadable metadata file must not be
+    // fatal. Rather than aborting the whole process (which would prevent the
+    // server from even starting to listen) we discard the old cache and fall
+    // back to a clean/cold start by returning -1 to the caller.
+    bool failed = false;
     if (restart_get_kv(&ctx, NULL, NULL) != RESTART_DONE) {
-        // First line must be a tag, so read it in and set up the proper
-        // callback here.
+        // The first line must be a recognized tag. Landing here means the file
+        // is garbled, starts with a value line, or references an unknown tag
+        // (e.g. written by an incompatible build).
         fprintf(stderr, "[restart] corrupt metadata file\n");
-        // TODO: this should probably just return -1 and skip the reuse.
-        abort();
-    }
-    if (ctx.cb == NULL) {
+        failed = true;
+    } else if (ctx.cb == NULL) {
+        // Reached EOF before reading any tag, e.g. an empty/truncated file.
         fprintf(stderr, "[restart] Failed to read a tag from metadata file\n");
-        abort();
+        failed = true;
     }
 
     // loop call the callback, check result code.
-    bool failed = false;
-    while (!ctx.done) {
+    // Skipped if we failed to read the header tag above: ctx.cb is NULL in
+    // that case and must not be dereferenced.
+    while (!failed && !ctx.done) {
         restart_data_cb *cb = ctx.cb;
         if (cb->ccb(cb->tag, &ctx, cb->data) != 0) {
             failed = true;
