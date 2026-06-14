@@ -385,6 +385,13 @@ static void slab_rebalance_rescue(struct slab_rebal_thread *t, struct _locked_st
 // - individual chunks need to be refcounted, with refcounts protected by item
 // lock. then they can be swapped out an released on refcount reduction
 // - for chunked item headers I don't know how off-hand.
+//
+// Until then, active chunked items are left in place and retried on subsequent
+// passes. They must never be forcibly deleted: the item is still valid and
+// referenced by clients, and deleting it would cause spurious hot-key loss
+// during page migration (manual or automove). The rebalance loop will keep
+// retrying until the item's refcount drops and it can be rescued or reclaimed
+// normally.
 static int slab_rebalance_active_rescue(struct slab_rebal_thread *t, struct _locked_st *a) {
     int cls_size = t->rebal.cls_size;
     item *it = a->it;
@@ -406,19 +413,11 @@ static int slab_rebalance_active_rescue(struct slab_rebal_thread *t, struct _loc
         // old it is now unlinked. can't immediately rescue item.
         t->new_it = NULL;
         return 0;
-    } else {
-        // else if chunked, check if we've been busy-waiting too long and
-        // delete the item.
-        if (t->rebal.busy_loops > SLAB_MOVE_MAX_LOOPS) {
-            // TODO: add indicator for source of eviction
-            LOGGER_LOG(t->l, LOG_EVICTIONS, LOGGER_EVICTION, it);
-            STORAGE_delete(t->storage, it);
-            do_item_unlink(it, a->hv);
-            t->rebal.busy_deletes++;
-        }
     }
 
-    // failed to rescue busy item.
+    // Chunked items (header or chunk body) cannot be actively rescued yet.
+    // Return busy so the caller retries on the next pass. Do NOT delete:
+    // the item is still live and referenced by clients.
     return 1;
 }
 
