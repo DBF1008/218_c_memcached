@@ -271,7 +271,7 @@ int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp) {
         new_it = do_item_alloc_pull(ntotal, clsid);
     }
     if (new_it == NULL)
-        return -1;
+        return STORAGE_GET_OOM;
     // so we can free the chunk on a miss
     new_it->slabs_clsid = clsid;
 
@@ -306,7 +306,7 @@ int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp) {
         if (eio->iov == NULL) {
             item_remove(new_it);
             do_cache_free(t->io_cache, p);
-            return -1;
+            return STORAGE_GET_OOM;
         }
 
         // fill the header so we can get the full data + crc back.
@@ -316,14 +316,19 @@ int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp) {
 
         while (remain > 0) {
             chunk = do_item_alloc_chunk(chunk, remain);
-            // FIXME: _pure evil_, silently erroring if item is too large.
+            // Two distinct failure modes that previously both looked like OOM:
+            //  - chunk == NULL: genuinely out of memory building the buffer.
+            //  - ciovcnt > IOV_MAX-1: the object is too large to assemble a
+            //    read plan for; it would need more iovecs than the system
+            //    allows. That's a size/limit failure, not memory exhaustion.
             if (chunk == NULL || ciovcnt > IOV_MAX-1) {
+                int res = (chunk == NULL) ? STORAGE_GET_OOM : STORAGE_GET_TOOBIG;
                 item_remove(new_it);
                 free(eio->iov);
                 // TODO: wrapper function for freeing up an io wrap?
                 eio->iov = NULL;
                 do_cache_free(t->io_cache, p);
-                return -1;
+                return res;
             }
             eio->iov[ciovcnt].iov_base = chunk->data;
             eio->iov[ciovcnt].iov_len = (remain < chunk->size) ? remain : chunk->size;

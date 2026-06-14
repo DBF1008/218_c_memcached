@@ -677,13 +677,22 @@ int process_get_cmd(LIBEVENT_THREAD *t, const char *key, const int nkey, mc_resp
 
 #ifdef EXTSTORE
       if (it->it_flags & ITEM_HDR) {
-          if (storage_cb(t, it, resp) != 0) {
+          int storage_ret = storage_cb(t, it, resp);
+          if (storage_ret != 0) {
               pthread_mutex_lock(&t->stats.mutex);
-              t->stats.get_oom_extstore++;
+              if (storage_ret == STORAGE_GET_TOOBIG) {
+                  t->stats.get_too_big_extstore++;
+              } else {
+                  t->stats.get_oom_extstore++;
+              }
               pthread_mutex_unlock(&t->stats.mutex);
 
               item_remove(it);
-              pout_errstring(resp, "SERVER_ERROR out of memory writing get response");
+              if (storage_ret == STORAGE_GET_TOOBIG) {
+                  pout_errstring(resp, "SERVER_ERROR object too large for read response");
+              } else {
+                  pout_errstring(resp, "SERVER_ERROR out of memory writing get response");
+              }
               return -1;
           }
       } else if ((it->it_flags & ITEM_CHUNKED) == 0) {
@@ -1171,9 +1180,14 @@ void process_mget_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_resp *resp,
         if (of.value) {
 #ifdef EXTSTORE
             if (it->it_flags & ITEM_HDR) {
-                if (storage_cb(t, it, resp) != 0) {
+                int storage_ret = storage_cb(t, it, resp);
+                if (storage_ret != 0) {
                     pthread_mutex_lock(&t->stats.mutex);
-                    t->stats.get_oom_extstore++;
+                    if (storage_ret == STORAGE_GET_TOOBIG) {
+                        t->stats.get_too_big_extstore++;
+                    } else {
+                        t->stats.get_oom_extstore++;
+                    }
                     pthread_mutex_unlock(&t->stats.mutex);
 
                     failed = true;

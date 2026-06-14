@@ -16,6 +16,15 @@ void storage_stats(ADD_STAT add_stats, void *c);
 void process_extstore_stats(ADD_STAT add_stats, void *c);
 bool storage_validate_item(void *e, item *it);
 #ifdef EXTSTORE
+// storage_get_item() (and the proxy storage fetch) return codes. 0 means the
+// read IO was queued successfully. Negative values describe *why* the fetch
+// failed so callers can keep accurate stats instead of attributing every
+// failure to out-of-memory.
+enum {
+    STORAGE_GET_OK = 0,
+    STORAGE_GET_OOM = -1,    // couldn't allocate the item/iovec/chunk memory
+    STORAGE_GET_TOOBIG = -2, // object needs more iovecs than IOV_MAX allows
+};
 int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp);
 #else
 #define storage_get_item NULL

@@ -530,9 +530,14 @@ static void process_bin_get_or_touch(conn *c, char *extbuf) {
             if (it->it_flags & ITEM_HDR) {
                 mc_resp *resp = c->resp;
                 resp->binary_prot = true;
-                if (storage_get_item(c->thread, it, resp) != 0) {
+                int storage_ret = storage_get_item(c->thread, it, resp);
+                if (storage_ret != 0) {
                     pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.get_oom_extstore++;
+                    if (storage_ret == STORAGE_GET_TOOBIG) {
+                        c->thread->stats.get_too_big_extstore++;
+                    } else {
+                        c->thread->stats.get_oom_extstore++;
+                    }
                     pthread_mutex_unlock(&c->thread->stats.mutex);
 
                     failed = true;
