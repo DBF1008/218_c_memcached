@@ -448,6 +448,53 @@ is(<$watcher>, "OK\r\n", "watcher enabled");
     check_version($ps);
 }
 
+# A backend whose config carries a logging "tag" (logging.detail) must still be
+# treated as unchanged across reloads of an identical config. The detail string
+# is strdup'd into the live backend, so a pointer-based comparison would wrongly
+# rebuild the backend on every reload, dropping its connection pool and emitting
+# watcher noise. Repeatedly reloading the same config must reuse the backend.
+{
+    note("Testing repeated reload with backend logging detail does not rebuild backends");
+    $watcher = $p_srv->new_sock;
+    print $watcher "watch proxyevents\n";
+    is(<$watcher>, "OK\r\n", "watcher enabled");
+
+    my $msrv = mock_server(11518);
+    my $ms = IO::Select->new();
+    $ms->add($msrv);
+
+    # First load creates the logging-enabled backend connection.
+    write_modefile('return "logdetail"');
+    $p_srv->reload();
+    wait_reload_relaxed($watcher);
+
+    my @readable = $ms->can_read(0.25);
+    is(scalar @readable, 1, "listener became readable for new logging backend");
+    my $be = accept_backend($readable[0]);
+
+    print $ps "mg logkey\r\n";
+    is(scalar <$be>, "mg logkey\r\n", "logging backend received request");
+    print $be "EN\r\n";
+    is(scalar <$ps>, "EN\r\n", "miss received from logging backend");
+
+    # Reload the identical config repeatedly: the backend must be reused, so no
+    # new connection should be made on any of the reloads.
+    for my $iter (1 .. 2) {
+        $p_srv->reload();
+        wait_reload_relaxed($watcher);
+        @readable = $ms->can_read(0.5);
+        is(scalar @readable, 0, "no new backend connection after identical reload $iter");
+    }
+
+    # The original connection must still be usable: the pool was not broken.
+    print $ps "mg logkey2\r\n";
+    is(scalar <$be>, "mg logkey2\r\n", "reused backend still receives requests");
+    print $be "EN\r\n";
+    is(scalar <$ps>, "EN\r\n", "miss received from reused backend");
+
+    check_version($ps);
+}
+
 # TODO:
 # remove backends
 # do dead sockets close?

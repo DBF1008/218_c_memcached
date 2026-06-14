@@ -558,6 +558,26 @@ static int mcplib_backend(lua_State *L) {
     return 1; // return be object.
 }
 
+// Compare two logging configs for content equivalence.
+// _mcplib_make_backendconn() strdup()'s logging.detail into the live backend,
+// so its pointer differs from the freshly parsed config even when the text is
+// identical. A raw memcmp() of the struct would therefore see an unchanged
+// backend as "changed" on reload and needlessly rebuild it (dropping the
+// connection pool and emitting watcher noise). Compare the detail string by
+// content instead so equivalent configs compare equal.
+static bool _mcplib_backend_logging_eq(const struct proxy_logging *a,
+        const struct proxy_logging *b) {
+    if (a->deadline != b->deadline
+            || a->rate != b->rate
+            || a->all_errors != b->all_errors) {
+        return false;
+    }
+    if (a->detail == NULL || b->detail == NULL) {
+        return a->detail == b->detail;
+    }
+    return strcmp(a->detail, b->detail) == 0;
+}
+
 // Called with the cache label at top of the stack.
 static mcp_backend_wrap_t *_mcplib_backend_checkcache(lua_State *L, mcp_backend_label_t *bel) {
     // first check our reference table to compare.
@@ -570,7 +590,7 @@ static mcp_backend_wrap_t *_mcplib_backend_checkcache(lua_State *L, mcp_backend_
                 && strncmp(be_orig->be->port, bel->port, MAX_PORTLEN) == 0
                 && be_orig->be->conncount == bel->conncount
                 && memcmp(&be_orig->be->tunables, &bel->tunables, sizeof(bel->tunables)) == 0
-                && memcmp(&be_orig->be->logging, &bel->logging, sizeof(bel->logging)) == 0) {
+                && _mcplib_backend_logging_eq(&be_orig->be->logging, &bel->logging)) {
             // backend is the same, return it.
             return be_orig;
         } else {
