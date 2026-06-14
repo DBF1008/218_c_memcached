@@ -1812,6 +1812,7 @@ void server_stats(ADD_STAT add_stats, void *c) {
         APPEND_STAT("get_extstore", "%llu", (unsigned long long)thread_stats.get_extstore);
         APPEND_STAT("get_aborted_extstore", "%llu", (unsigned long long)thread_stats.get_aborted_extstore);
         APPEND_STAT("get_oom_extstore", "%llu", (unsigned long long)thread_stats.get_oom_extstore);
+        APPEND_STAT("get_oversized_extstore", "%llu", (unsigned long long)thread_stats.get_oversized_extstore);
         APPEND_STAT("recache_from_extstore", "%llu", (unsigned long long)thread_stats.recache_from_extstore);
         APPEND_STAT("miss_from_extstore", "%llu", (unsigned long long)thread_stats.miss_from_extstore);
         APPEND_STAT("badcrc_from_extstore", "%llu", (unsigned long long)thread_stats.badcrc_from_extstore);

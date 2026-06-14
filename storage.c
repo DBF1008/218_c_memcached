@@ -271,7 +271,7 @@ int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp) {
         new_it = do_item_alloc_pull(ntotal, clsid);
     }
     if (new_it == NULL)
-        return -1;
+        return STORAGE_GET_OOM;
     // so we can free the chunk on a miss
     new_it->slabs_clsid = clsid;
 
@@ -293,7 +293,6 @@ int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp) {
     p->payload = offsetof(io_pending_storage_t, io_ctx);
     obj_io *eio = &p->io_ctx;
 
-    // FIXME: error handling.
     if (chunked) {
         unsigned int ciovcnt = 0;
         size_t remain = new_it->nbytes;
@@ -306,7 +305,7 @@ int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp) {
         if (eio->iov == NULL) {
             item_remove(new_it);
             do_cache_free(t->io_cache, p);
-            return -1;
+            return STORAGE_GET_OOM;
         }
 
         // fill the header so we can get the full data + crc back.
@@ -316,14 +315,22 @@ int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp) {
 
         while (remain > 0) {
             chunk = do_item_alloc_chunk(chunk, remain);
-            // FIXME: _pure evil_, silently erroring if item is too large.
-            if (chunk == NULL || ciovcnt > IOV_MAX-1) {
+            if (chunk == NULL) {
+                // Genuine memory allocation failure — slab memory exhausted.
                 item_remove(new_it);
                 free(eio->iov);
-                // TODO: wrapper function for freeing up an io wrap?
                 eio->iov = NULL;
                 do_cache_free(t->io_cache, p);
-                return -1;
+                return STORAGE_GET_OOM;
+            }
+            if (ciovcnt > IOV_MAX-1) {
+                // Item requires more iovec slots than the OS writev() limit allows.
+                // This is a size/structural limit, not an out-of-memory condition.
+                item_remove(new_it);
+                free(eio->iov);
+                eio->iov = NULL;
+                do_cache_free(t->io_cache, p);
+                return STORAGE_GET_OVERSIZED;
             }
             eio->iov[ciovcnt].iov_base = chunk->data;
             eio->iov[ciovcnt].iov_len = (remain < chunk->size) ? remain : chunk->size;
@@ -375,7 +382,7 @@ int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp) {
     t->stats.get_extstore++;
     pthread_mutex_unlock(&t->stats.mutex);
 
-    return 0;
+    return STORAGE_GET_OK;
 }
 
 void storage_submit_cb(io_queue_t *q) {

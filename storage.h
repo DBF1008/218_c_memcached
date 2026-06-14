@@ -16,6 +16,10 @@ void storage_stats(ADD_STAT add_stats, void *c);
 void process_extstore_stats(ADD_STAT add_stats, void *c);
 bool storage_validate_item(void *e, item *it);
 #ifdef EXTSTORE
+// Return codes for storage_get_item():
+#define STORAGE_GET_OK          0   // IO queued successfully
+#define STORAGE_GET_OOM        -1   // Memory allocation failure (item, chunk, or iov malloc)
+#define STORAGE_GET_OVERSIZED  -2   // Item requires more iovec slots than IOV_MAX allows
 int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp);
 #else
 #define storage_get_item NULL

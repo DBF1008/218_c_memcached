@@ -466,6 +466,9 @@ static void process_bin_get_or_touch(conn *c, char *extbuf) {
                              c->cmd == PROTOCOL_BINARY_CMD_GATK);
     int should_return_value = (c->cmd != PROTOCOL_BINARY_CMD_TOUCH);
     bool failed = false;
+#ifdef EXTSTORE
+    int extstore_err = 0;
+#endif
 
     if (settings.verbose > 1) {
         fprintf(stderr, "<%d %s ", c->sfd, should_touch ? "TOUCH" : "GET");

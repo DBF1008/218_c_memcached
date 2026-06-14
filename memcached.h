@@ -350,6 +350,7 @@ struct slab_stats {
     X(get_extstore) \
     X(get_aborted_extstore) \
     X(get_oom_extstore) \
+    X(get_oversized_extstore) \
     X(recache_from_extstore) \
     X(miss_from_extstore) \
     X(badcrc_from_extstore)
