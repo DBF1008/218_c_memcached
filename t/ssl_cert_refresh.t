@@ -84,6 +84,41 @@ my $stats_after = mem_stats($sock);
 cmp_ok($stats_after->{time_since_server_cert_refresh}, '<',
     $stats->{time_since_server_cert_refresh}, 'Certs refreshed');
 
+# Regression: a failed refresh must not corrupt the live SSL context.
+# Swap in a certificate that does NOT match the still-installed private key, so
+# the refresh fails at the private-key validation step. With an in-place (non
+# atomic) refresh the live context would be left holding the new certificate
+# together with the old key, breaking every subsequent handshake. The refresh
+# must instead be rejected and leave the previously loaded certificate serving.
+copy($cert, $cert_back) or die "Cert backup failed: $!";
+copy($new_cert_key, $cert) or die "Mismatched cert copy failed: $!";
+
+print $sock "refresh_certs\r\n";
+my $bad_refresh = scalar <$sock>;
+isnt($bad_refresh, "OK\r\n", "refresh with mismatched cert/key was rejected");
+like($bad_refresh, qr/error/i, "got an error message for the failed refresh");
+
+# The live context must still be intact: a brand new connection should complete
+# the TLS handshake and present the original certificate.
+my $sock_after_fail = $server->new_sock;
+ok($sock_after_fail, "new connection still succeeds after a failed refresh");
+SKIP: {
+    skip "no usable connection after failed refresh", 1 unless $sock_after_fail;
+    my $details = $sock_after_fail->dump_peer_certificate();
+    $details =~ m/(OU=([^\/\n]*))/;
+    is($1, $default_crt_ou,
+        'New connections keep the old cert after a failed refresh');
+}
+
+# Restoring a valid certificate must let refreshes succeed again.
+move($cert_back, $cert) or die "Cert restore failed: $!";
+print $sock "refresh_certs\r\n";
+is(scalar <$sock>, "OK\r\n", "refresh succeeds again after restoring a valid cert");
+
+$cert_details = $server->new_sock->dump_peer_certificate();
+$cert_details =~ m/(OU=([^\/\n]*))/;
+is($1, $default_crt_ou, 'Old cert is served for new connections again');
+
 done_testing();
 
 END {

@@ -4,6 +4,7 @@
 
 #include "tls.h"
 #include <string.h>
+#include <stdarg.h>
 #include <sysexits.h>
 #include <sys/param.h>
 #include <openssl/ssl.h>
@@ -23,6 +24,9 @@ static ssize_t ssl_write(conn *c, void *buf, size_t count);
 static void print_ssl_error(char *buff, size_t len);
 static void ssl_callback(const SSL *s, int where, int ret);
 static int ssl_new_session_callback(SSL *s, SSL_SESSION *sess);
+static char *ssl_alloc_error(const char *fmt, ...);
+static bool load_server_certificates(SSL_CTX *ctx, char **errmsg);
+static SSL_CTX *ssl_init_ctx(char **errmsg);
 
 static pthread_mutex_t ssl_ctx_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -276,11 +280,38 @@ static void print_ssl_error(char *buff, size_t len) {
 }
 
 /*
- * Loads server certificates to the SSL context and validate them.
+ * Allocates a heap string for caller-owned error reporting.
+ * The returned buffer must be freed by the caller (e.g. via free() or
+ * write_and_free()). Returns NULL on allocation failure.
+ */
+static char *ssl_alloc_error(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int len = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (len < 0) {
+        return NULL;
+    }
+    char *buf = malloc((size_t)len + 1);
+    if (buf == NULL) {
+        return NULL;
+    }
+    va_start(ap, fmt);
+    vsnprintf(buf, (size_t)len + 1, fmt, ap);
+    va_end(ap);
+    return buf;
+}
+
+/*
+ * Loads server certificates into the given SSL context and validates them.
+ * The certificates are loaded into the caller-provided context (which the
+ * caller owns) rather than the live settings.ssl_ctx. This lets a refresh
+ * build a fresh context and only publish it once every step has succeeded,
+ * so a failure here can never leave a half-updated context serving traffic.
  * @return whether certificates are successfully loaded and verified or not.
  * @param error_msg contains the error when unsuccessful.
  */
-static bool load_server_certificates(char **errmsg) {
+static bool load_server_certificates(SSL_CTX *ctx, char **errmsg) {
     bool success = false;
 
     const size_t CRLF_NULLCHAR_LEN = 3;
@@ -294,12 +325,6 @@ static bool load_server_certificates(char **errmsg) {
         return false;
     }
 
-    if (settings.ssl_ctx == NULL) {
-        snprintf(error_msg, errmax, "Error TLS not enabled\r\n");
-        *errmsg = error_msg;
-        return false;
-    }
-
     char *ssl_err_msg = malloc(SSL_ERROR_MSG_SIZE);
     if (ssl_err_msg == NULL) {
         free(error_msg);
@@ -309,40 +334,39 @@ static bool load_server_certificates(char **errmsg) {
     bzero(ssl_err_msg, SSL_ERROR_MSG_SIZE);
     size_t err_msg_size = 0;
 
-    SSL_LOCK();
-    if (!SSL_CTX_use_certificate_chain_file(settings.ssl_ctx,
+    // No SSL_LOCK is needed here: ctx is private to the caller and not yet
+    // visible to any worker thread until it is swapped into settings.ssl_ctx.
+    if (!SSL_CTX_use_certificate_chain_file(ctx,
         settings.ssl_chain_cert)) {
         print_ssl_error(ssl_err_msg, SSL_ERROR_MSG_SIZE);
         err_msg_size = snprintf(error_msg, errmax, "Error loading the certificate chain: "
             "%s : %s", settings.ssl_chain_cert, ssl_err_msg);
-    } else if (!SSL_CTX_use_PrivateKey_file(settings.ssl_ctx, settings.ssl_key,
+    } else if (!SSL_CTX_use_PrivateKey_file(ctx, settings.ssl_key,
                                         settings.ssl_keyformat)) {
         print_ssl_error(ssl_err_msg, SSL_ERROR_MSG_SIZE);
         err_msg_size = snprintf(error_msg, errmax, "Error loading the key: %s : %s",
             settings.ssl_key, ssl_err_msg);
-    } else if (!SSL_CTX_check_private_key(settings.ssl_ctx)) {
+    } else if (!SSL_CTX_check_private_key(ctx)) {
         print_ssl_error(ssl_err_msg, SSL_ERROR_MSG_SIZE);
         err_msg_size = snprintf(error_msg, errmax, "Error validating the certificate: %s",
             ssl_err_msg);
     } else if (settings.ssl_ca_cert) {
-        if (!SSL_CTX_load_verify_locations(settings.ssl_ctx,
+        if (!SSL_CTX_load_verify_locations(ctx,
           settings.ssl_ca_cert, NULL)) {
             print_ssl_error(ssl_err_msg, SSL_ERROR_MSG_SIZE);
             err_msg_size = snprintf(error_msg, errmax,
               "Error loading the CA certificate: %s : %s",
               settings.ssl_ca_cert, ssl_err_msg);
         } else {
-            SSL_CTX_set_client_CA_list(settings.ssl_ctx,
+            SSL_CTX_set_client_CA_list(ctx,
               SSL_load_client_CA_file(settings.ssl_ca_cert));
             success = true;
         }
     } else {
         success = true;
     }
-    SSL_UNLOCK();
     free(ssl_err_msg);
     if (success) {
-        settings.ssl_last_cert_refresh_time = current_time;
         free(error_msg);
     } else {
         *errmsg = error_msg;
@@ -393,6 +417,73 @@ void ssl_init_settings(void) {
 }
 
 /*
+ * Builds a fully configured server SSL context from the current settings,
+ * including certificates, verification mode, ciphers, session cache and any
+ * optional options. The returned context is independent of the live
+ * settings.ssl_ctx so it can be validated in full before being published.
+ * @return a new SSL_CTX on success, or NULL on failure with *errmsg set to a
+ *         heap-allocated, caller-owned error string (NULL on allocation error).
+ */
+static SSL_CTX *ssl_init_ctx(char **errmsg) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (ctx == NULL) {
+        *errmsg = ssl_alloc_error("Error creating the SSL context\r\n");
+        return NULL;
+    }
+
+    SSL_CTX_set_min_proto_version(ctx, settings.ssl_min_version);
+
+    // The server certificate, private key and validations.
+    if (!load_server_certificates(ctx, errmsg)) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    // The verification mode of client certificate, default is SSL_VERIFY_PEER.
+    SSL_CTX_set_verify(ctx, settings.ssl_verify_mode, NULL);
+    if (settings.ssl_ciphers && !SSL_CTX_set_cipher_list(ctx,
+                                                    settings.ssl_ciphers)) {
+        *errmsg = ssl_alloc_error("Error setting the provided cipher(s): %s\r\n",
+                settings.ssl_ciphers);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    // Optional session caching; default disabled.
+    if (settings.ssl_session_cache) {
+        SSL_CTX_sess_set_new_cb(ctx, ssl_new_session_callback);
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
+        SSL_CTX_set_session_id_context(ctx,
+                                       (const unsigned char *) SESSION_ID_CONTEXT,
+                                       strlen(SESSION_ID_CONTEXT));
+    } else {
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+    }
+
+    // Optional kernel TLS offload; default disabled.
+    if (settings.ssl_kernel_tls) {
+#if defined(SSL_OP_ENABLE_KTLS)
+        SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+#else
+        *errmsg = ssl_alloc_error("Kernel TLS offload is not available\r\n");
+        SSL_CTX_free(ctx);
+        return NULL;
+#endif
+    }
+
+#ifdef SSL_OP_NO_RENEGOTIATION
+    // Disable TLS re-negotiation if SSL_OP_NO_RENEGOTIATION is defined for
+    // openssl 1.1.0h or above
+    SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
+#endif
+
+    // Release TLS read/write buffers of idle connections
+    SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
+
+    return ctx;
+}
+
+/*
  * Verify SSL settings and initiates the SSL context.
  */
 int ssl_init(void) {
@@ -402,56 +493,18 @@ int ssl_init(void) {
 
     // SSL context for the process. All connections will share one
     // process level context.
-    settings.ssl_ctx = SSL_CTX_new(TLS_server_method());
-
-    SSL_CTX_set_min_proto_version(settings.ssl_ctx, settings.ssl_min_version);
-
-    // The server certificate, private key and validations.
-    char *error_msg;
-    if (!load_server_certificates(&error_msg)) {
-        fprintf(stderr, "%s", error_msg);
-        free(error_msg);
+    char *error_msg = NULL;
+    SSL_CTX *ctx = ssl_init_ctx(&error_msg);
+    if (ctx == NULL) {
+        if (error_msg != NULL) {
+            fprintf(stderr, "%s", error_msg);
+            free(error_msg);
+        }
         exit(EX_USAGE);
     }
 
-    // The verification mode of client certificate, default is SSL_VERIFY_PEER.
-    SSL_CTX_set_verify(settings.ssl_ctx, settings.ssl_verify_mode, NULL);
-    if (settings.ssl_ciphers && !SSL_CTX_set_cipher_list(settings.ssl_ctx,
-                                                    settings.ssl_ciphers)) {
-        fprintf(stderr, "Error setting the provided cipher(s): %s\n",
-                settings.ssl_ciphers);
-        exit(EX_USAGE);
-    }
-
-    // Optional session caching; default disabled.
-    if (settings.ssl_session_cache) {
-        SSL_CTX_sess_set_new_cb(settings.ssl_ctx, ssl_new_session_callback);
-        SSL_CTX_set_session_cache_mode(settings.ssl_ctx, SSL_SESS_CACHE_SERVER);
-        SSL_CTX_set_session_id_context(settings.ssl_ctx,
-                                       (const unsigned char *) SESSION_ID_CONTEXT,
-                                       strlen(SESSION_ID_CONTEXT));
-    } else {
-        SSL_CTX_set_session_cache_mode(settings.ssl_ctx, SSL_SESS_CACHE_OFF);
-    }
-
-    // Optional kernel TLS offload; default disabled.
-    if (settings.ssl_kernel_tls) {
-#if defined(SSL_OP_ENABLE_KTLS)
-        SSL_CTX_set_options(settings.ssl_ctx, SSL_OP_ENABLE_KTLS);
-#else
-        fprintf(stderr, "Kernel TLS offload is not available\n");
-        exit(EX_USAGE);
-#endif
-    }
-
-#ifdef SSL_OP_NO_RENEGOTIATION
-    // Disable TLS re-negotiation if SSL_OP_NO_RENEGOTIATION is defined for
-    // openssl 1.1.0h or above
-    SSL_CTX_set_options(settings.ssl_ctx, SSL_OP_NO_RENEGOTIATION);
-#endif
-
-    // Release TLS read/write buffers of idle connections
-    SSL_CTX_set_mode(settings.ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
+    settings.ssl_ctx = ctx;
+    settings.ssl_last_cert_refresh_time = current_time;
 
     return 0;
 }
@@ -490,7 +543,36 @@ int ssl_new_session_callback(SSL *s, SSL_SESSION *sess) {
 }
 
 bool refresh_certs(char **errmsg) {
-    return load_server_certificates(errmsg);
+    if (settings.ssl_ctx == NULL) {
+        *errmsg = ssl_alloc_error("Error TLS not enabled\r\n");
+        return false;
+    }
+
+    // Build and fully validate a brand new context before touching the live
+    // one. This makes the refresh atomic: a failure at any step leaves the
+    // currently serving certificate/key/CA untouched instead of partially
+    // overwriting the live SSL_CTX.
+    SSL_CTX *new_ctx = ssl_init_ctx(errmsg);
+    if (new_ctx == NULL) {
+        return false;
+    }
+
+    // Atomically publish the new context. ssl_accept() reads settings.ssl_ctx
+    // (and calls SSL_new on it) under SSL_LOCK, so swapping under the same lock
+    // is safe against concurrent accepts. Existing connections keep their own
+    // reference to the old context (SSL_new bumped its refcount) and continue
+    // to use the old certificate until they close.
+    SSL_LOCK();
+    SSL_CTX *old_ctx = settings.ssl_ctx;
+    settings.ssl_ctx = new_ctx;
+    settings.ssl_last_cert_refresh_time = current_time;
+    SSL_UNLOCK();
+
+    // Drop our reference to the old context. OpenSSL frees it once the last
+    // connection still using it goes away.
+    SSL_CTX_free(old_ctx);
+
+    return true;
 }
 
 void ssl_help(void) {
