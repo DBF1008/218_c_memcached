@@ -97,14 +97,24 @@ static int restart_check(const char *file) {
     ctx.done = false;
     if (restart_get_kv(&ctx, NULL, NULL) != RESTART_DONE) {
         // First line must be a tag, so read it in and set up the proper
-        // callback here.
-        fprintf(stderr, "[restart] corrupt metadata file\n");
-        // TODO: this should probably just return -1 and skip the reuse.
-        abort();
+        // callback here. If it's not a valid tag line the metadata is
+        // corrupt; give up on reuse and start with a clean cache.
+        fprintf(stderr, "[restart] corrupt metadata file, starting with a clean cache\n");
+        if (ctx.line)
+            free(ctx.line);
+        fclose(f);
+        unlink(metafile);
+        free(metafile);
+        return -1;
     }
     if (ctx.cb == NULL) {
-        fprintf(stderr, "[restart] Failed to read a tag from metadata file\n");
-        abort();
+        fprintf(stderr, "[restart] Failed to read a tag from metadata file, starting with a clean cache\n");
+        if (ctx.line)
+            free(ctx.line);
+        fclose(f);
+        unlink(metafile);
+        free(metafile);
+        return -1;
     }
 
     // loop call the callback, check result code.

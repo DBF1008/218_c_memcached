@@ -12,13 +12,51 @@ use MemcachedTest;
 # /dev/shm.
 my $mem_path = "/tmp/mc_restart.$$";
 
-# read a invalid metadata file
+# Regression: corrupted/invalid metadata files should not crash the server.
+# The server should give up on reuse and start with a clean cache.
 {
     my $meta_path = "$mem_path.meta";
-    open(my $f, "> $meta_path") || die("Can't open a metadata file.");
-    eval {  new_memcached("-e $mem_path"); };
+
+    # Test 1: empty metadata file (no tags, no data).
+    {
+        open(my $f, "> $meta_path") || die("Can't open a metadata file.");
+        close($f);
+        my $srv = new_memcached("-m 16 -e $mem_path");
+        ok($srv, "Server started with an empty metadata file");
+        my $s = $srv->sock;
+        print $s "set foo 0 0 3\r\nbar\r\n";
+        like(scalar <$s>, qr/STORED/, "set works after empty metadata recovery");
+        # Handle's DESTROY will kill the server when $srv goes out of scope.
+    }
     unlink($meta_path);
-    ok($@, "Died with an empty metadata file");
+
+    # Test 2: garbage/corrupt content in metadata file.
+    {
+        open(my $f, "> $meta_path") || die("Can't open a metadata file.");
+        print $f "this is not valid metadata at all\n";
+        close($f);
+        my $srv = new_memcached("-m 16 -e $mem_path");
+        ok($srv, "Server started with garbage metadata");
+        my $s = $srv->sock;
+        print $s "set foo 0 0 3\r\nbar\r\n";
+        like(scalar <$s>, qr/STORED/, "set works after garbage metadata recovery");
+    }
+    unlink($meta_path);
+
+    # Test 3: valid tag format but unknown/unregistered tag name.
+    {
+        open(my $f, "> $meta_path") || die("Can't open a metadata file.");
+        print $f "Tnonexistent_tag\n";
+        print $f "Ksomekey somevalue\n";
+        close($f);
+        my $srv = new_memcached("-m 16 -e $mem_path");
+        ok($srv, "Server started with unknown tag in metadata");
+        my $s = $srv->sock;
+        print $s "set foo 0 0 3\r\nbar\r\n";
+        like(scalar <$s>, qr/STORED/, "set works after unknown-tag metadata recovery");
+    }
+    unlink($meta_path);
+    unlink($mem_path);
 }
 
 my $server = new_memcached("-m 128 -e $mem_path -I 2m -o temporary_ttl=240");
