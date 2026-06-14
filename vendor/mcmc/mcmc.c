@@ -255,9 +255,14 @@ static int _mcmc_parse_stat_line(const char *buf, mcmc_resp_t *r) {
     return MCMC_CODE_OK;
 }
 
-// FIXME: This is broken for ASCII multiget.
-// if we get VALUE back, we need to stay in ASCII GET read mode until an END
-// is seen.
+// Parse a single response line.
+// This is intentionally stateless: each call decodes exactly one line (one
+// VALUE, one STAT, END, a meta line, etc). For ASCII multiget and STAT the
+// server returns a sequence of VALUE/STAT lines terminated by a single END.
+// A caller drives this in a loop, advancing the buffer by (reslen + vlen_read)
+// each time. To keep "ASCII GET read mode" across lines until END is seen
+// (and to guard against treating the trailing value stream as a new command),
+// use the stateful mcmc_parse_buf_multi() wrapper below.
 static int _mcmc_parse_response(const char *buf, size_t read, mcmc_resp_t *r) {
     const char *cur = buf;
     int rlen; // response code length.
@@ -761,6 +766,76 @@ int mcmc_parse_buf(const char *buf, size_t read, mcmc_resp_t *r) {
     // have a \r. check for it and fail?
 
     return _mcmc_parse_response(buf, read, r);
+}
+
+// Stateful wrapper around mcmc_parse_buf() for multi-line response streams.
+//
+// ASCII multiget ("get k1 k2 k3") and STAT return a stream of VALUE/STAT lines
+// terminated by a single END. mcmc_parse_buf() decodes one line per call but
+// has no memory of being mid-stream, so a naive caller that stopped after the
+// first VALUE would leave the remaining value stream in the buffer and later
+// misread it as a new command's response.
+//
+// This wrapper threads a small state object so the parser stays in GET (or
+// STAT) read mode until END is seen:
+//   - DEFAULT: a VALUE enters GET mode, a STAT enters STAT mode; any other
+//     line is an ordinary self-contained response.
+//   - GET mode: another VALUE keeps us in GET mode (further multiget hit), END
+//     returns to DEFAULT (stream complete). Any other line is a protocol
+//     desync and is reported as a parse failure.
+//   - STAT mode: same shape with STAT/END.
+//
+// Usage mirrors mcmc_parse_buf(): zero-init the state once, then for each line
+// call this and advance the buffer by (r->reslen + r->vlen_read). A
+// MCMC_WANT_READ result, or a value that only partially fit the buffer
+// (vlen_read < vlen), leaves the mode untouched so lines/values that span
+// buffer boundaries resume correctly on the next call.
+int mcmc_parse_buf_multi(const char *buf, size_t read, mcmc_parse_state_t *st, mcmc_resp_t *r) {
+    int rv = mcmc_parse_buf(buf, read, r);
+
+    // Not enough data yet for a full response line. Preserve our read mode and
+    // let the caller pull more bytes before retrying.
+    if (r->code == MCMC_WANT_READ) {
+        return rv;
+    }
+
+    switch (st->state) {
+    case STATE_DEFAULT:
+        if (r->type == MCMC_RESP_GET) {
+            st->state = STATE_GET_RESP;
+        } else if (r->type == MCMC_RESP_STAT) {
+            st->state = STATE_STAT_RESP;
+        }
+        // else: ordinary single-line response, stay in DEFAULT.
+        break;
+    case STATE_GET_RESP:
+        if (r->type == MCMC_RESP_GET) {
+            // another multiget hit; remain in GET read mode.
+        } else if (r->type == MCMC_RESP_END) {
+            st->state = STATE_DEFAULT; // multiget stream complete.
+        } else {
+            // Expected VALUE or END while reading a multiget: desynced.
+            st->state = STATE_DEFAULT;
+            r->type = MCMC_RESP_FAIL;
+            r->code = MCMC_ERR_PARSE;
+            return MCMC_ERR;
+        }
+        break;
+    case STATE_STAT_RESP:
+        if (r->type == MCMC_RESP_STAT) {
+            // another stat line; remain in STAT read mode.
+        } else if (r->type == MCMC_RESP_END) {
+            st->state = STATE_DEFAULT; // stat stream complete.
+        } else {
+            st->state = STATE_DEFAULT;
+            r->type = MCMC_RESP_FAIL;
+            r->code = MCMC_ERR_PARSE;
+            return MCMC_ERR;
+        }
+        break;
+    }
+
+    return rv;
 }
 
 // Context-ful API.

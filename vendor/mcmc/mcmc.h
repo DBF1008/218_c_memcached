@@ -96,6 +96,16 @@ typedef struct mcmc_resp_s {
     };
 } mcmc_resp_t;
 
+// Persistent state for parsing multi-line response streams (ASCII multiget
+// VALUE lists and STAT lists). Zero-initialize before the first call, then
+// thread the same struct through mcmc_parse_buf_multi() for every line of the
+// stream. This lets the parser "stay" in GET (or STAT) read mode until the
+// terminating END is seen, instead of treating the first VALUE as a complete
+// response and desyncing on the trailing value stream.
+typedef struct mcmc_parse_state_s {
+    int state; // internal: which multi-line read mode we're in.
+} mcmc_parse_state_t;
+
 #define MCMC_PARSER_MAX_TOKENS 24
 #define MCMC_PARSER_MFLAG_HAS_SPACE (1)
 #define MCMC_PARSER_MFLAG_NOREPLY (1<<1)
@@ -123,6 +133,7 @@ int mcmc_fd(void *c);
 size_t mcmc_size(int options);
 size_t mcmc_min_buffer_size(int options);
 int mcmc_parse_buf(const char *buf, size_t read, mcmc_resp_t *r);
+int mcmc_parse_buf_multi(const char *buf, size_t read, mcmc_parse_state_t *st, mcmc_resp_t *r);
 int mcmc_connect(void *c, char *host, char *port, int options);
 int mcmc_check_nonblock_connect(void *c, int *err);
 int mcmc_send_request(void *c, const char *request, int len, int count);
